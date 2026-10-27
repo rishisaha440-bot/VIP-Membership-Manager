@@ -1,25 +1,26 @@
 """
 Telegram VIP Membership Manager Bot
 ===================================
-Stack : Python 3.10+, pyTelegramBotAPI (telebot), Flask (webhook), SQLite
-Target: PythonAnywhere (WSGI webhook + external cron such as cron-job.org)
+Stack : Python 3.10+, pyTelegramBotAPI (telebot), Flask (webhook), PostgreSQL
+Target: Koyeb (gunicorn webhook) + free Neon Postgres + external cron (cron-job.org)
 
-pip install pyTelegramBotAPI flask
+pip install pyTelegramBotAPI flask gunicorn psycopg2-binary
 
 Secrets are read from environment variables (never hardcode them):
     BOT_TOKEN   - token from @BotFather
     CRON_SECRET - any long random string (protects /cron-check and /set-webhook)
+    DATABASE_URL - PostgreSQL connection string (e.g. from Neon). Members/expiry
+                   dates are stored here, so they survive restarts and redeploys.
+    WEBHOOK_BASE_URL - public app URL, e.g. https://<app>.koyeb.app
 
-PythonAnywhere WSGI file (set the variables BEFORE importing the bot):
-    import os
-    os.environ["BOT_TOKEN"] = "<your bot token>"
-    os.environ["CRON_SECRET"] = "<your random secret>"
-    from vip_bot import app as application
+Koyeb start command (Procfile):
+    web: gunicorn Code:app --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:${PORT:-8000}
 
 Setup:
     1. Make the bot ADMIN in the group (Restrict members + Invite users).
     2. Open  https://<host>/set-webhook?secret=<CRON_SECRET>   once.
-    3. cron-job.org -> GET https://<host>/cron-check?secret=<CRON_SECRET> every 15-60 min.
+    3. cron-job.org -> GET https://<host>/cron-check?secret=<CRON_SECRET> every 15-30 min.
+       (This also keeps the free Koyeb instance awake.)
 """
 
 import hmac
@@ -27,13 +28,14 @@ import html
 import logging
 import os
 import re
-import sqlite3
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+import psycopg2
 import telebot
+from psycopg2.extras import RealDictCursor
 from flask import Flask, request, abort, jsonify
 from telebot import types
 
@@ -43,15 +45,14 @@ from telebot import types
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 CRON_SECRET = os.environ.get("CRON_SECRET", "").strip()
 
-if not BOT_TOKEN or not CRON_SECRET:
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+if not BOT_TOKEN or not CRON_SECRET or not DATABASE_URL:
     raise RuntimeError(
-        "Missing configuration: set the BOT_TOKEN and CRON_SECRET environment variables."
+        "Missing configuration: set BOT_TOKEN, CRON_SECRET and DATABASE_URL environment variables."
     )
 
 WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", "").strip()
-DB_PATH = os.environ.get(
-    "DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "vip_manager.db")
-)
 
 DAY = 86400
 MAX_DAYS = 3650
@@ -100,81 +101,78 @@ def fmt_remaining(seconds: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Database (thread-safe, auto-migrating)
+# Database (PostgreSQL, auto-migrating)
 # --------------------------------------------------------------------------- #
-_db_lock = threading.RLock()
+class _Conn:
+    """Thin wrapper: keeps `?` placeholders and `c.execute(...).fetchall()` style."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, sql, params=()):
+        cur = self._conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(sql.replace("?", "%s"), params)
+        return cur
 
 
 @contextmanager
 def db():
-    with _db_lock:
-        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=30000")
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=15)
+    try:
+        yield _Conn(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 GROUPS_COLUMNS = {
-    "group_id": "INTEGER PRIMARY KEY",
     "title": "TEXT",
     "active": "INTEGER DEFAULT 1",
 }
 
 MEMBERS_COLUMNS = {
-    "group_id": "INTEGER",
-    "user_id": "INTEGER",
     "full_name": "TEXT",
     "username": "TEXT",
-    "join_date": "INTEGER",
-    "expiry_date": "INTEGER",
+    "join_date": "BIGINT",
+    "expiry_date": "BIGINT",
     "status": "TEXT DEFAULT 'pending'",
     "reminded_3d": "INTEGER DEFAULT 0",
     "reminded_last": "INTEGER DEFAULT 0",
     "approved_by": "TEXT",
-    "card_message_id": "INTEGER",
+    "card_message_id": "BIGINT",
 }
 
 
 def _migrate_columns(conn, table, columns):
-    existing = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
     for col, decl in columns.items():
-        if col not in existing:
-            # PRIMARY KEY can't be added via ALTER; strip it for migrations.
-            decl = decl.replace("PRIMARY KEY", "").strip()
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-            log.info("Migration: added %s.%s", table, col)
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {decl}")
 
 
 def init_db():
     with db() as c:
         c.execute(
             """CREATE TABLE IF NOT EXISTS groups (
-                group_id INTEGER PRIMARY KEY,
+                group_id BIGINT PRIMARY KEY,
                 title TEXT,
                 active INTEGER DEFAULT 1
             )"""
         )
         c.execute(
             """CREATE TABLE IF NOT EXISTS members (
-                group_id INTEGER,
-                user_id INTEGER,
+                group_id BIGINT,
+                user_id BIGINT,
                 full_name TEXT,
                 username TEXT,
-                join_date INTEGER,
-                expiry_date INTEGER,
+                join_date BIGINT,
+                expiry_date BIGINT,
                 status TEXT DEFAULT 'pending',
                 reminded_3d INTEGER DEFAULT 0,
                 reminded_last INTEGER DEFAULT 0,
                 approved_by TEXT,
-                card_message_id INTEGER,
+                card_message_id BIGINT,
                 PRIMARY KEY (group_id, user_id)
             )"""
         )
@@ -669,8 +667,8 @@ def on_my_groups(call):
     with db() as c:
         for g in mine:
             n = c.execute(
-                "SELECT COUNT(*) FROM members WHERE group_id=? AND status='active'", (g["group_id"],)
-            ).fetchone()[0]
+                "SELECT COUNT(*) AS n FROM members WHERE group_id=? AND status='active'", (g["group_id"],)
+            ).fetchone()["n"]
             lines.append(f"• <b>{html.escape(g['title'] or str(g['group_id']))}</b> — {n} active VIP")
     bot.send_message(call.message.chat.id, "📂 <b>Your groups</b>\n\n" + "\n".join(lines))
 
